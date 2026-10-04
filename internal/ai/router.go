@@ -23,7 +23,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"math/rand/v2"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -41,7 +44,17 @@ type Policy struct {
 	MaxRetries int
 	// Backoff is the base delay between retries (doubled each retry).
 	Backoff time.Duration
+	// MaxBackoff caps the delay between retries. Defaults to 30s.
+	MaxBackoff time.Duration
 }
+
+const (
+	defaultBackoff    = 500 * time.Millisecond
+	defaultMaxBackoff = 30 * time.Second
+	maxRetriesLimit   = 10
+	maxErrorBodyBytes = 2048
+	maxResponseBytes  = 16 << 20
+)
 
 // Usage reports token usage.
 type Usage struct {
@@ -72,6 +85,8 @@ type Result[T any] struct {
 type HTTPError struct {
 	StatusCode int
 	Body       string
+	// RetryAfter is the server-requested delay, if any.
+	RetryAfter time.Duration
 }
 
 func (e *HTTPError) Error() string {
@@ -104,6 +119,11 @@ type Router struct {
 	Headers    map[string]string
 	// Telemetry, if set, is called after every attempt.
 	Telemetry func(CallRecord)
+	// Logger receives debug logs for each attempt. Defaults to a discard logger.
+	Logger *slog.Logger
+	// Validate, if set, is called on decoded output; a non-nil error is
+	// treated as a schema failure.
+	Validate func(any) error
 	// Sleep is overridable for tests.
 	Sleep func(ctx context.Context, d time.Duration) error
 }
@@ -136,9 +156,17 @@ type chatResponse struct {
 // returns output that decodes into T. Retries happen here (not in the HTTP
 // client) so they cannot multiply with fallbacks.
 func RunModelTask[T any](ctx context.Context, r *Router, task string, policy Policy, messages []ChatMessage) (*Result[T], error) {
+	if r == nil || r.BaseURL == "" {
+		return nil, errors.New("router base URL is not configured")
+	}
 	if len(policy.Models) == 0 {
 		return nil, fmt.Errorf("no models configured for task %q", task)
 	}
+	if len(messages) == 0 {
+		return nil, fmt.Errorf("no messages provided for task %q", task)
+	}
+	policy = policy.normalized()
+	log := r.logger()
 	var failures []error
 	for _, model := range policy.Models {
 		for attempt := 0; attempt <= policy.MaxRetries; attempt++ {
@@ -153,6 +181,7 @@ func RunModelTask[T any](ctx context.Context, r *Router, task string, policy Pol
 			if err == nil {
 				return &Result[T]{Data: data, Model: model, Usage: usage, Attempt: attempt}, nil
 			}
+			log.DebugContext(ctx, "model attempt failed", "task", task, "model", model, "attempt", attempt, "duration", time.Since(start), "error", err)
 			failures = append(failures, fmt.Errorf("%s (attempt %d): %w", model, attempt, err))
 			if !retryable(err) {
 				if isFatal(err) {
@@ -161,7 +190,7 @@ func RunModelTask[T any](ctx context.Context, r *Router, task string, policy Pol
 				break
 			}
 			if attempt < policy.MaxRetries {
-				if err := r.sleep(ctx, policy.Backoff<<attempt); err != nil {
+				if err := r.sleep(ctx, policy.delay(attempt, err)); err != nil {
 					return nil, err
 				}
 			}
@@ -200,12 +229,16 @@ func callOnce[T any](ctx context.Context, r *Router, model string, messages []Ch
 		return zero, Usage{}, err
 	}
 	defer resp.Body.Close()
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return zero, Usage{}, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return zero, Usage{}, &HTTPError{StatusCode: resp.StatusCode, Body: string(respBody)}
+		msg := string(respBody)
+		if len(msg) > maxErrorBodyBytes {
+			msg = msg[:maxErrorBodyBytes] + "...(truncated)"
+		}
+		return zero, Usage{}, &HTTPError{StatusCode: resp.StatusCode, Body: msg, RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 	var cr chatResponse
 	if err := json.Unmarshal(respBody, &cr); err != nil {
@@ -217,6 +250,11 @@ func callOnce[T any](ctx context.Context, r *Router, model string, messages []Ch
 	var out T
 	if err := json.Unmarshal([]byte(extractJSON(cr.Choices[0].Message.Content)), &out); err != nil {
 		return zero, cr.Usage, fmt.Errorf("%w: %v", ErrSchema, err)
+	}
+	if r.Validate != nil {
+		if err := r.Validate(out); err != nil {
+			return zero, cr.Usage, fmt.Errorf("%w: %v", ErrSchema, err)
+		}
 	}
 	return out, cr.Usage, nil
 }
@@ -244,7 +282,7 @@ func retryable(err error) bool {
 	if errors.As(err, &he) {
 		return he.StatusCode == http.StatusTooManyRequests || he.StatusCode >= 500
 	}
-	if errors.Is(err, ErrEmptyResponse) || errors.Is(err, ErrSchema) || errors.Is(err, context.Canceled) {
+	if errors.Is(err, ErrEmptyResponse) || errors.Is(err, ErrSchema) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 	// Network errors.
@@ -263,4 +301,55 @@ func (r *Router) sleep(ctx context.Context, d time.Duration) error {
 	case <-t.C:
 		return nil
 	}
+}
+
+func (p Policy) normalized() Policy {
+	if p.MaxRetries < 0 {
+		p.MaxRetries = 0
+	}
+	if p.MaxRetries > maxRetriesLimit {
+		p.MaxRetries = maxRetriesLimit
+	}
+	if p.Backoff <= 0 {
+		p.Backoff = defaultBackoff
+	}
+	if p.MaxBackoff <= 0 {
+		p.MaxBackoff = defaultMaxBackoff
+	}
+	return p
+}
+
+// delay returns the wait before the next retry: exponential backoff with
+// jitter, capped at MaxBackoff, honoring Retry-After when larger.
+func (p Policy) delay(attempt int, err error) time.Duration {
+	d := p.MaxBackoff
+	if attempt < 31 {
+		if b := p.Backoff << attempt; b > 0 && b < d {
+			d = b
+		}
+	}
+	// Full jitter in [d/2, d].
+	d = d/2 + time.Duration(rand.Int64N(int64(d/2)+1))
+	var he *HTTPError
+	if errors.As(err, &he) && he.RetryAfter > d {
+		d = he.RetryAfter
+		if d > p.MaxBackoff {
+			d = p.MaxBackoff
+		}
+	}
+	return d
+}
+
+func parseRetryAfter(v string) time.Duration {
+	if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return 0
+}
+
+func (r *Router) logger() *slog.Logger {
+	if r.Logger != nil {
+		return r.Logger
+	}
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
